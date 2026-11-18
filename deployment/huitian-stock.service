@@ -1,0 +1,26 @@
+[Unit]
+Description=Huitian stock management
+After=network.target
+
+[Service]
+Type=simple
+User=huitian-stock
+Group=huitian-stock
+WorkingDirectory=/opt/huitian-stock
+StateDirectory=huitian-stock
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 -B /opt/huitian-stock/app.py --db /var/lib/huitian-stock/stock.sqlite3 serve --host 127.0.0.1 --port 18765 --secure-cookie --base-path /huitian --public-origin https://inventory.example.com
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=192M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
