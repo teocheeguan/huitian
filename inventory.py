@@ -11,11 +11,12 @@ ROOT = Path(__file__).resolve().parent
 CHINA = timezone(timedelta(hours=8))
 MAX_QTY = 1_000_000
 SOURCES = {'小程序', '微信', '电话', '到店', '其他'}
+CATEGORIES = {'water': '桶装水', 'empty': '空桶系列', 'bottle': '瓶装水', 'other': '其他'}
 TITLES = {
-    'OPEN_STOCK': '期初库存', 'OPEN_BUCKET': '期初桶账', 'IN': '入库',
+    'OPEN_STOCK': '期初库存', 'OPEN_BUCKET': '期初桶账', 'IN': '进货入库',
     'OUT': '出库', 'COUNT': '盘点', 'TRANSFER': '调拨', 'SALE': '销售',
     'SEND': '补记送出', 'BUCKET_RETURN': '回空桶', 'DEPOSIT': '押桶',
-    'REFUND': '退押', 'RETURN': '满水退货', 'REVERSE': '冲销',
+    'REFUND': '退押', 'RETURN': '销售退货', 'REVERSE': '冲销',
 }
 
 
@@ -35,7 +36,37 @@ def connect(path):
 def initialize(path):
     with closing(connect(path)) as db:
         db.execute('PRAGMA journal_mode=WAL')
+        if scalar(db, 'PRAGMA user_version') == 0 and scalar(db, "SELECT 1 FROM sqlite_master WHERE name='products'"):
+            upgrade_products(db)
         db.executescript((ROOT / 'schema.sql').read_text(encoding='utf-8'))
+        if scalar(db, 'PRAGMA user_version') == 0:
+            db.execute('PRAGMA user_version=1')
+
+
+def upgrade_products(db):
+    # Preserve product IDs and the foreign keys held by existing stock and documents.
+    db.execute('PRAGMA foreign_keys=OFF')
+    try:
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            if scalar(db, 'PRAGMA user_version') != 0:
+                return
+            db.execute('''CREATE TABLE products_v1 (
+                id INTEGER PRIMARY KEY, sku TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL,
+                brand TEXT NOT NULL, spec TEXT NOT NULL, category TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('water','empty','bottle','other')),
+                bucket_id INTEGER REFERENCES products(id), active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                CHECK((kind='water' AND bucket_id IS NOT NULL) OR (kind<>'water' AND bucket_id IS NULL)))''')
+            db.execute('''INSERT INTO products_v1 SELECT id,sku,name,brand,spec,category,
+                kind,bucket_id,active FROM products''')
+            db.execute('DROP TABLE products')
+            db.execute('ALTER TABLE products_v1 RENAME TO products')
+            db.execute("CREATE UNIQUE INDEX empty_brand_spec ON products(brand COLLATE NOCASE,spec COLLATE NOCASE) WHERE kind='empty'")
+            if db.execute('PRAGMA foreign_key_check').fetchone():
+                raise Problem('商品升级遇到异常关联，原库已保留')
+            db.execute('PRAGMA user_version=1')
+    finally:
+        db.execute('PRAGMA foreign_keys=ON')
 
 
 def rows(db, sql, args=()):
@@ -115,21 +146,26 @@ def get_product(db, product_id, active=True):
     return found
 
 
-def save_product(db, user, data):
+def save_product(db, user, data, *, catalog=False):
     hq(user)
     sku = txt(data.get('sku'), '商品编码', 70)
     name = txt(data.get('name'), '商品名称', 120)
     brand = txt(data.get('brand'), '品牌', 60)
     spec = txt(data.get('spec'), '规格', 40)
     category = txt(data.get('category'), '商品分类', 60)
-    kind = data.get('kind')
-    if kind not in ('water', 'empty'):
-        raise Problem('请选择满水或空桶')
+    kind = next((key for key, label in CATEGORIES.items() if label == category), None) if catalog else data.get('kind')
+    if kind not in CATEGORIES:
+        raise Problem('请选择有效的商品分类')
     current = None
     if data.get('id') is not None:
-        current = get_product(db, data['id'], active=False)
-        if (brand, spec, kind) != (current['brand'], current['spec'], current['kind']):
-            raise Problem('品牌、规格和类型用于区分库存，请为新的品牌或规格建立新商品')
+        current = get_product(db, data['id'], active=catalog)
+    elif catalog:
+        current = row(db, 'SELECT * FROM products WHERE sku=? AND active=0', (sku,))
+    if current:
+        if (brand, spec) != (current['brand'], current['spec']) or (
+            kind != current['kind'] and {kind, current['kind']} != {'bottle','other'}
+        ):
+            raise Problem('请为新的品牌、规格或桶型建立新商品')
     bucket_id = None
     if kind == 'water':
         empty = row(db, """SELECT * FROM products WHERE kind='empty'
@@ -138,23 +174,43 @@ def save_product(db, user, data):
             import secrets
             bucket_id = db.execute('''INSERT INTO products(sku,name,brand,spec,category,kind)
                 VALUES(?,?,?,?,?,'empty')''',
-                ('KT-' + secrets.token_hex(5).upper(), f'{brand} {spec} 空桶', brand, spec, '空桶')).lastrowid
+                ('KT-' + secrets.token_hex(5).upper(), f'{brand} {spec} 空桶', brand, spec, '空桶系列')).lastrowid
         else:
             bucket_id = empty['id']
-            if not empty['active'] and data.get('active', True):
+            if not empty['active'] and catalog:
+                db.execute('UPDATE products SET active=1 WHERE id=?', (bucket_id,))
+            elif not empty['active'] and data.get('active', True):
                 raise Problem('请先启用对应品牌和规格的空桶')
-    active = data.get('active', True)
+    active = True if catalog else data.get('active', True)
     if type(active) is not bool:
         raise Problem('商品状态无效')
     if not active and kind == 'empty' and current:
         if scalar(db, 'SELECT 1 FROM products WHERE bucket_id=? AND active=1 LIMIT 1', (current['id'],)):
             raise Problem('请先停用仍使用此空桶的满水商品')
     if current:
-        db.execute('UPDATE products SET sku=?,name=?,category=?,active=? WHERE id=?',
-                   (sku, name, category, int(active), current['id']))
+        db.execute('UPDATE products SET sku=?,name=?,category=?,kind=?,active=? WHERE id=?',
+                   (sku, name, category, kind, int(active), current['id']))
         return current['id']
+    if catalog and kind == 'empty':
+        retired = scalar(db, """SELECT id FROM products WHERE kind='empty' AND active=0
+            AND brand=? COLLATE NOCASE AND spec=? COLLATE NOCASE""", (brand, spec))
+        if retired is not None:
+            db.execute('UPDATE products SET sku=?,name=?,category=?,active=1 WHERE id=?', (sku, name, category, retired))
+            return retired
     return db.execute('''INSERT INTO products(sku,name,brand,spec,category,kind,bucket_id,active)
         VALUES(?,?,?,?,?,?,?,?)''', (sku, name, brand, spec, category, kind, bucket_id, int(active))).lastrowid
+
+
+def delete_product(db, user, data):
+    hq(user)
+    product = get_product(db, data.get('id'), active=False)
+    product_id = product['id']
+    if scalar(db, 'SELECT 1 FROM stock WHERE product_id=? AND qty>0 LIMIT 1', (product_id,)):
+        raise Problem('此商品仍有门店库存，请先核对并处理结存', 409)
+    if scalar(db, 'SELECT 1 FROM products WHERE bucket_id=? AND active=1 LIMIT 1', (product_id,)):
+        raise Problem('此空桶仍关联在售的桶装水，请先处理对应商品', 409)
+    db.execute('UPDATE products SET active=0 WHERE id=?', (product_id,))
+    return product_id
 
 
 def customer_for(db, user, customer_id):
@@ -182,15 +238,17 @@ def save_customer(db, user, data):
 
 
 class Posting:
-    def __init__(self, db, user, data):
+    def __init__(self, db, user, data, *, order=False):
         self.db = db
         self.user = user
         self.data = data
         self.kind = data.get('kind')
+        self.order = order
         self.stock = defaultdict(int)
         self.buckets = defaultdict(lambda: [0, 0, 0, 0, 0])
         self.sales = defaultdict(int)
         self.dispatch = defaultdict(int)
+        self.order_buckets = defaultdict(lambda: [0, 0, 0])
         self.items = {}
         self.customer = None
         self.target = None
@@ -297,6 +355,32 @@ class Posting:
                 self.dispatch[(None, product_id)] += qty
                 self.bucket(product['bucket_id'], held=qty, sent=qty)
 
+    def store_order(self):
+        physical = self.data.get('empty_returns')
+        for product, qty, _ in self.line_entries():
+            product_id = product['id']
+            self.stock[(self.store, product_id)] -= qty
+            self.dispatch[(None, product_id)] += qty
+            if product['kind'] == 'water':
+                self.order_buckets[product['bucket_id']][0] += qty
+        if physical is None and not self.order_buckets:
+            physical = []
+        if not isinstance(physical, list) or len(physical) > 100:
+            raise Problem('请确认实收空桶，明细最多 100 条')
+        if physical and not self.order_buckets:
+            raise Problem('仅含桶装水的订单可登记实收空桶')
+        seen = set()
+        for entry in physical:
+            if not isinstance(entry, dict):
+                raise Problem('空桶明细格式错误')
+            bucket = self.product(entry.get('product_id'), 'empty')['id']
+            qty = integer(entry.get('qty'), '实收空桶数量')
+            if bucket in seen:
+                raise Problem('请合并相同品牌和规格的实收空桶')
+            seen.add(bucket)
+            self.order_buckets[bucket][1] += qty
+            self.stock[(self.store, bucket)] += qty
+
     def change_bucket(self):
         self.require_customer()
         for product, qty, line in self.line_entries('empty', self.kind == 'OPEN_BUCKET', active=False):
@@ -329,8 +413,11 @@ class Posting:
                 self.stock[(self.store, bucket)] += qty
 
     def return_or_send(self):
-        self.base_document('SALE')
-        for product, qty, entry in self.line_entries('water', active=False):
+        sale = self.base_document('SALE')
+        anonymous = sale['customer_id'] is None
+        if anonymous and self.kind == 'SEND':
+            raise Problem('门店订单确认时已登记送出')
+        for product, qty, entry in self.line_entries(None if anonymous else 'water', active=False):
             product_id = product['id']
             sale_qty = scalar(self.db, 'SELECT qty FROM document_items WHERE doc_id=? AND product_id=?',
                               (self.link, product_id)) or 0
@@ -350,8 +437,11 @@ class Posting:
                 raise Problem(f'{product["name"]}超过原订单已送出且未退数量')
             restock = integer(entry.get('restock', qty), '可再次销售数量', 0, qty)
             self.items[product_id] = (product, qty, restock)
-            self.sales[product_id] -= qty
-            self.bucket(product['bucket_id'], held=-qty, full_returned=qty)
+            if anonymous and product['kind'] == 'water':
+                self.order_buckets[product['bucket_id']][2] += qty
+            if not anonymous:
+                self.sales[product_id] -= qty
+                self.bucket(product['bucket_id'], held=-qty, full_returned=qty)
             if restock:
                 self.stock[(self.store, product_id)] += restock
 
@@ -377,6 +467,8 @@ class Posting:
         for move in self.db.execute('SELECT * FROM bucket_log WHERE doc_id=?', (self.link,)):
             self.buckets[move['bucket_id']] = [-move[key] for key in
                 ('deposit_delta','held_delta','sent','returned','full_returned')]
+        for move in self.db.execute('SELECT * FROM order_bucket_log WHERE doc_id=?', (self.link,)):
+            self.order_buckets[move['bucket_id']] = [-move[key] for key in ('sent','received','full_returned')]
         for move in self.db.execute('SELECT * FROM sales_log WHERE doc_id=?', (self.link,)):
             self.sales[move['product_id']] -= move['qty']
         for move in self.db.execute('SELECT * FROM dispatch_log WHERE doc_id=?', (self.link,)):
@@ -390,7 +482,8 @@ class Posting:
         key = txt(data.get('request_key'), '请求编号', 75)
         if not re.fullmatch(r'[A-Za-z0-9_-]{12,75}', key):
             raise Problem('提交编号有误，请刷新后重试')
-        fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        fingerprint_data = {**data, '_order': True} if self.order else data
+        fingerprint = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         existing = row(db, 'SELECT * FROM documents WHERE request_key=?', (key,))
         if existing:
             if existing['operator'] != self.user['id'] or existing['fingerprint'] != fingerprint:
@@ -405,7 +498,10 @@ class Posting:
         elif self.kind == 'TRANSFER':
             self.transfer()
         elif self.kind == 'SALE':
-            self.sale()
+            if self.order:
+                self.store_order()
+            else:
+                self.sale()
         elif self.kind in ('BUCKET_RETURN','DEPOSIT','REFUND','OPEN_BUCKET'):
             self.change_bucket()
         elif self.kind in ('SEND','RETURN'):
@@ -459,6 +555,8 @@ class Posting:
                        (doc, self.store, self.customer, bucket_id, *moves))
         for product_id, qty in self.sales.items():
             db.execute('INSERT INTO sales_log VALUES(?,?,?,?,?)', (doc, self.store, self.customer, product_id, qty))
+        for bucket_id, moves in self.order_buckets.items():
+            db.execute('INSERT INTO order_bucket_log VALUES(?,?,?,?,?)', (doc, bucket_id, *moves))
         for (sale_id, product_id), qty in self.dispatch.items():
             db.execute('INSERT INTO dispatch_log VALUES(?,?,?,?)', (doc, sale_id or doc, product_id, qty))
         return doc, False

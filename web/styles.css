@@ -144,9 +144,13 @@ dialog::backdrop { background: #24203060; }
 .inline label { flex: 1; }
 .inline button { flex: 0 0 auto; }
 .lines { display: grid; gap: 6px; }
-.line-grid { display: grid; align-items: start; grid-template-columns: minmax(135px,1fr) 83px auto; gap: 7px; }
+.line-grid { display: grid; align-items: end; grid-template-columns: minmax(105px,1fr) 105px auto; gap: 7px; }
 .line-grid.four { grid-template-columns: minmax(135px,1fr) 76px 76px auto; }
 .checkbox-row { display: flex; align-items: center; gap: 7px; }
+.order-empty { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; }
+.order-empty legend { font-weight: 600; padding: 0 4px; }
+.order-empty .lines,.order-empty .checkbox-row { margin-top: 8px; }
+.order-empty .lines:not(:empty) { margin-bottom: 8px; }
 .d-footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 7px; padding-top: 4px; }
 .d-detail { display: grid; gap: 10px; }
 .d-detail .card { overflow: hidden; }

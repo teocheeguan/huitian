@@ -19,9 +19,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import reports
-from importing import HEADERS, load_opening
-from inventory import (CHINA, ROOT, TITLES, Posting, Problem, connect, hq, ident, initialize,
-                       row, rows, save_customer, save_product, save_store, scalar, store_for, txt)
+from inventory import (CATEGORIES, CHINA, ROOT, TITLES, Posting, Problem, connect, delete_product, hq,
+                       ident, initialize, row, rows, save_product, save_store, scalar, store_for, txt)
 
 ITERATIONS = 600_000
 SESSION_AGE = 12 * 60 * 60
@@ -211,20 +210,25 @@ class Handler(BaseHTTPRequestHandler):
             return {
                 'user':user, 'today':datetime.now(CHINA).date().isoformat(), 'titles':TITLES,
                 'stores': rows(db,'SELECT * FROM stores WHERE active=1 ORDER BY code'),
-                'products': rows(db,'SELECT * FROM products ORDER BY kind DESC,brand,spec,name'),
+                'products': [dict(p, category=CATEGORIES[p['kind']]) for p in rows(db,
+                    'SELECT * FROM products WHERE active=1 ORDER BY kind DESC,brand,spec,name')],
+                'stock_adjustments': rows(db,'''SELECT p.* FROM products p WHERE p.active=0 AND EXISTS (
+                    SELECT 1 FROM stock s WHERE s.product_id=p.id AND s.qty>0 AND (?1 IS NULL OR s.store_id=?1))''',
+                    (user['store_id'],)),
+                'categories': CATEGORIES,
             }
         readers = {
             '/api/dashboard':reports.dashboard,'/api/stock':reports.stock_rows,'/api/history':reports.history,
-            '/api/documents':reports.documents,'/api/customers':reports.customers,'/api/buckets':reports.bucket_rows,
+            '/api/documents':reports.documents,
         }
         if path in readers:
             return readers[path](db,user,args)
         match = re.fullmatch('/api/documents/([0-9]{1,10})',path)
         if match:
-            return reports.document_detail(db,user,int(match[1]))
-        match = re.fullmatch('/api/customers/([0-9]{1,10})/balances',path)
-        if match:
-            return reports.customer_balances(db,user,int(match[1]),args)
+            detail = reports.document_detail(db,user,int(match[1]))
+            for field in ('customer','customer_id','source','external_number','buckets'):
+                detail.pop(field, None)
+            return detail
         if path == '/api/users':
             hq(user)
             return rows(db,'''SELECT u.id,u.login,u.name,u.role,u.store_id,u.active,s.name AS store
@@ -232,15 +236,19 @@ class Handler(BaseHTTPRequestHandler):
         raise Problem('页面不存在',404)
 
     def post_api(self,db,user,path,data):
-        writers = {'/api/stores': save_store, '/api/products':save_product,
-                   '/api/customers':save_customer, '/api/users':save_user}
+        writers = {'/api/stores': save_store, '/api/products/delete':delete_product, '/api/users':save_user}
         if path in writers:
             return {'id':writers[path](db,user,data)}
-        if path == '/api/post':
+        if path == '/api/products':
+            return {'id':save_product(db,user,data,catalog=True)}
+        if path == '/api/orders':
+            fields = ('store_id', 'items', 'empty_returns', 'request_key', 'note')
+            doc, duplicate = Posting(db,user,dict(kind='SALE', **{k:data[k] for k in fields if k in data}),
+                                     order=True).write()
+            return {'id':doc,'duplicate':duplicate}
+        if path == '/api/post' and data.get('kind') in ('IN','OUT','COUNT','TRANSFER','SEND','RETURN','REVERSE'):
             doc, duplicate = Posting(db,user,data).write()
             return {'id':doc,'duplicate':duplicate}
-        if path == '/api/import':
-            return {'count':load_opening(db,user,data)}
         raise Problem('页面不存在',404)
 
     def process(self):
@@ -280,13 +288,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     raise Problem('请先登录系统',401)
                 if self.command == 'GET':
-                    match = re.fullmatch('/api/templates/(stock|bucket)',path)
-                    if match:
-                        hq(user)
-                        template = ','.join(HEADERS[match[1]])+'\r\n'
-                        self.reply(200,template.encode('utf-8-sig'),'text/csv; charset=utf-8',
-                                   filename=f'opening-{match[1]}.csv')
-                        return
                     with db:
                         db.execute('BEGIN')
                         result = self.get_api(db,user,path,args)
@@ -381,7 +382,6 @@ def main():
     database.parent.mkdir(parents=True,exist_ok=True)
     if args.action == 'backup' and not database.is_file():
         parser.exit(1,'待备份数据库不存在\n')
-    initialize(database)
     def choose_password():
         password = getpass.getpass('设置登录密码（至少 12 个字符）：')
         if password != getpass.getpass('再次输入密码：'):
@@ -389,6 +389,8 @@ def main():
         return password
 
     try:
+        if args.action != 'backup':
+            initialize(database)
         if args.action in ('init-admin','demo'):
             password = choose_password()
             if args.action == 'init-admin':

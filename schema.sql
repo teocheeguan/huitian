@@ -16,9 +16,9 @@ CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY, sku TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL,
   brand TEXT NOT NULL, spec TEXT NOT NULL, category TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK(kind IN ('water','empty')), bucket_id INTEGER REFERENCES products(id),
+  kind TEXT NOT NULL CHECK(kind IN ('water','empty','bottle','other')), bucket_id INTEGER REFERENCES products(id),
   active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-  CHECK((kind='water' AND bucket_id IS NOT NULL) OR (kind='empty' AND bucket_id IS NULL))
+  CHECK((kind='water' AND bucket_id IS NOT NULL) OR (kind<>'water' AND bucket_id IS NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS empty_brand_spec ON products(brand COLLATE NOCASE,spec COLLATE NOCASE) WHERE kind='empty';
 CREATE TABLE IF NOT EXISTS customers (
@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS bucket_log (
 );
 CREATE INDEX IF NOT EXISTS bucket_customer ON bucket_log(customer_id,bucket_id,store_id,doc_id);
 CREATE INDEX IF NOT EXISTS bucket_store ON bucket_log(store_id,doc_id);
+CREATE TABLE IF NOT EXISTS order_bucket_log (
+  doc_id INTEGER NOT NULL REFERENCES documents(id), bucket_id INTEGER NOT NULL REFERENCES products(id),
+  sent INTEGER NOT NULL, received INTEGER NOT NULL, full_returned INTEGER NOT NULL,
+  PRIMARY KEY(doc_id,bucket_id)
+);
 CREATE TABLE IF NOT EXISTS sales_log (
   doc_id INTEGER NOT NULL REFERENCES documents(id), store_id INTEGER NOT NULL REFERENCES stores(id),
   customer_id INTEGER NOT NULL REFERENCES customers(id), product_id INTEGER NOT NULL REFERENCES products(id),
@@ -94,6 +99,8 @@ CREATE TRIGGER IF NOT EXISTS stock_log_immutable_update BEFORE UPDATE ON stock_l
 CREATE TRIGGER IF NOT EXISTS stock_log_immutable_delete BEFORE DELETE ON stock_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
 CREATE TRIGGER IF NOT EXISTS bucket_log_immutable_update BEFORE UPDATE ON bucket_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
 CREATE TRIGGER IF NOT EXISTS bucket_log_immutable_delete BEFORE DELETE ON bucket_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
+CREATE TRIGGER IF NOT EXISTS order_bucket_log_immutable_update BEFORE UPDATE ON order_bucket_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
+CREATE TRIGGER IF NOT EXISTS order_bucket_log_immutable_delete BEFORE DELETE ON order_bucket_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
 CREATE TRIGGER IF NOT EXISTS sales_log_immutable_update BEFORE UPDATE ON sales_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
 CREATE TRIGGER IF NOT EXISTS sales_log_immutable_delete BEFORE DELETE ON sales_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
 CREATE TRIGGER IF NOT EXISTS dispatch_log_immutable_update BEFORE UPDATE ON dispatch_log BEGIN SELECT RAISE(ABORT, 'immutable history'); END;
