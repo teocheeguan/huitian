@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import reports
 from inventory import (CATEGORIES, CHINA, ROOT, TITLES, Posting, Problem, connect, delete_product, hq,
-                       ident, initialize, row, rows, save_product, save_store, scalar, store_for, txt)
+                       ident, initialize, row, rows, save_customer, save_product, save_store, scalar, store_for, txt)
 
 ITERATIONS = 600_000
 SESSION_AGE = 12 * 60 * 60
@@ -219,10 +219,13 @@ class Handler(BaseHTTPRequestHandler):
             }
         readers = {
             '/api/dashboard':reports.dashboard,'/api/stock':reports.stock_rows,'/api/history':reports.history,
-            '/api/documents':reports.documents,
+            '/api/documents':reports.documents,'/api/stock-summary':reports.stock_summary,
         }
         if path in readers:
             return readers[path](db,user,args)
+        match = re.fullmatch('/api/stock/([0-9]{1,10})',path)
+        if match:
+            return reports.stock_rows(db,user,args,int(match[1]))
         match = re.fullmatch('/api/documents/([0-9]{1,10})',path)
         if match:
             detail = reports.document_detail(db,user,int(match[1]))
@@ -236,6 +239,8 @@ class Handler(BaseHTTPRequestHandler):
         raise Problem('页面不存在',404)
 
     def post_api(self,db,user,path,data):
+        if path == '/api/dashboard/products':
+            return reports.update_dashboard_product(db,user,data)
         writers = {'/api/stores': save_store, '/api/products/delete':delete_product, '/api/users':save_user}
         if path in writers:
             return {'id':writers[path](db,user,data)}

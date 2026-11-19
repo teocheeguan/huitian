@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS products (
   CHECK((kind='water' AND bucket_id IS NOT NULL) OR (kind<>'water' AND bucket_id IS NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS empty_brand_spec ON products(brand COLLATE NOCASE,spec COLLATE NOCASE) WHERE kind='empty';
+CREATE TABLE IF NOT EXISTS dashboard_products (
+  user_id INTEGER NOT NULL REFERENCES users(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  PRIMARY KEY(user_id,product_id)
+);
 CREATE TABLE IF NOT EXISTS customers (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL UNIQUE, address TEXT NOT NULL DEFAULT '',
   creator_store INTEGER REFERENCES stores(id), created_day TEXT NOT NULL

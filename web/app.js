@@ -176,25 +176,34 @@ function heading(title, note='') {
 }
 const featuredBrands = ['景田','长龙','奥绿','鼎湖山泉大氧吧'];
 
+function dashboardStock(kind, label, stock) {
+  const items = stock.filter(item=>item.kind===kind);
+  const selected = items.filter(item=>item.selected);
+  const available = items.filter(item=>!item.selected).map(item=>[item.id,item.sku+' · '+item.name]);
+  const qty = (selected.length?selected:items).reduce((total,item)=>total+item.qty,0);
+  const columns = [plain('商品编码','sku'),plain('商品名称','name'),count('结存','qty'),
+    column('操作',item=>act('移除','unwatch-sku',item.id,'ghost slim'))];
+  return `<section class="sku-watch">
+    ${heading(label)}
+    <div class="sku-watch-controls"><strong class="num">${num(qty)}</strong><small>${selected.length?'所选编码合计':'全部编码合计'}</small>
+      ${available.length?`<div class="sku-watch-picker"><select aria-label="${label}商品编码">${selectors(available,'','请选择商品编码')}</select>
+        ${act('添加','watch-sku','','slim')}</div>`:''}
+    </div>
+    ${selected.length?makeTable(columns,selected):''}
+  </section>`;
+}
+
 function overview(data) {
   const brands = Array.from(new Set([...featuredBrands,...data.brands,...data.stock.map(e=>e.brand)]));
-  const locationStock = new Map();
-  const brandStock = new Map();
-  for (const entry of data.stock) {
-    locationStock.set(JSON.stringify([entry.store_id,entry.brand,entry.kind]),entry.qty);
-    const key = JSON.stringify([entry.brand,entry.kind]);
-    brandStock.set(key,(brandStock.get(key)||0)+entry.qty);
-  }
+  const locationStock = new Map(data.stock.map(entry=>[JSON.stringify([entry.store_id,entry.brand,entry.kind]),entry.qty]));
   const amount = (value) => `<span class="num">${num(value)}</span>`;
-  const brandRows = brands.map(brand=>({brand,water:brandStock.get(JSON.stringify([brand,'water'])),
-    empty:brandStock.get(JSON.stringify([brand,'empty']))}));
   const storeCols = [plain('门店','name'),count('订单数','orders'),
     ...brands.flatMap(brand=>[
       column(brand+'库存',store=>amount(locationStock.get(JSON.stringify([store.id,brand,'water']))),true),
       column(brand+'空桶库存',store=>amount(locationStock.get(JSON.stringify([store.id,brand,'empty']))),true),
     ])];
   const bucketCols = [storeColumn,...brandSpec,count('送出桶','sent'),count('回空桶','received'),count('差回空桶','missing')];
-  return pageHead(isHQ()?'总部运营看板':'门店运营看板','按品牌看库存，按北京时间查询每日桶账。',act('刷新','reload','','ghost')) +
+  return pageHead(isHQ()?'总部运营看板':'门店运营看板','按商品编码查看库存，按北京时间查询每日桶账。',act('刷新','reload','','ghost')) +
     `<form id="filters" class="filters card">
       <label>门店<select name="store" ${isHQ()?'':'disabled'}>${selectors(storeEntries(),state.store,isHQ()?'全部门店':null)}</select></label>
       <label>统计日期<input name="day" type="date" value="${esc(data.day)}" max="${esc(data.today)}" required></label>
@@ -202,7 +211,8 @@ function overview(data) {
     </form>
     <section class="card gap">${heading('运营指标','库存与订单总数按统计日截止。')}
       <div class="pad"><strong>订单总数　${num(data.totals.orders)}</strong></div>
-      ${makeTable([plain('品牌','brand'),count('桶装水库存','water'),count('空桶库存','empty')],brandRows)}
+      <div class="sku-watch-grid">${dashboardStock('water','桶装水库存',data.sku_stock)}
+      ${dashboardStock('empty','空桶库存',data.sku_stock)}</div>
     </section>
     <section class="card gap">${heading('桶账记录 · '+esc(data.day),'每天从零统计，往日记录可通过统计日期查询。')}
       <div class="pad bucket-overview">
@@ -240,7 +250,8 @@ function filtersFor(data) {
 function inventory(data) {
   const head = pageHead('库存管理','查看库存、流水和销售单据。',act('出库','post','OUT')+act('盘点','post','COUNT'));
   const cols = {
-    stock: [storeColumn,plain('商品编码','sku'),plain('商品名称','name'),...brandSpec,typeColumn,count('结存','qty')],
+    stock: [plain('商品编码','sku'),plain('商品名称','name'),...brandSpec,typeColumn,count('库存合计','qty'),
+      column('分店库存',entry=>act('查看分店','stock-breakdown',entry.id,'ghost slim'))],
     history: [column('单据号',e=>docLink(e.doc_id)),storeColumn,column('业务',e=>esc(titles(e.kind))+
       (e.kind==='COUNT'&&e.delta!==0?` <span class="tag">${e.delta>0?'盘盈':'盘亏'}</span>`:'')),
       plain('商品编码','sku'),plain('商品','name'),...brandSpec,column('变动',e=>signed(e.delta),true),
@@ -249,6 +260,13 @@ function inventory(data) {
   };
   const options = view()==='stock'?filtersFor(data):view()==='history'?{...filtersFor(data),types:[]}: {};
   return head + outerFilters(view()!=='stock') + `<section class="card">${tabsHtml()}${searchBar(options)}${table(cols[view()],data)}</section>`;
+}
+
+async function showStockBreakdown(id) {
+  const item = state.data.find(entry=>entry.id===id);
+  if (!item) return;
+  const rows = await api('/api/stock/'+id+'?'+new URLSearchParams({store:state.store}));
+  openModal(item.sku+' · '+item.name,makeTable([storeColumn,count('库存','qty')],rows,'当前范围暂无门店库存'));
 }
 
 function productPage(data) {
@@ -314,7 +332,7 @@ async function loadPage() {
     if (page==='orders') value = state.boot.stores.filter(e=>isHQ()||e.id===state.boot.user.store_id);
     if (page==='products') value = state.boot.products;
     if (page==='inventory') {
-      if (current==='stock') value = await api('/api/stock?'+filter);
+      if (current==='stock') value = await api('/api/stock-summary?'+filter);
       if (current==='history') value = await api('/api/history?'+filter);
       if (current==='sales') value = await api('/api/documents?'+params({group:'sales'}));
     }
@@ -655,6 +673,19 @@ document.addEventListener('click',async event=>{
     else if (action==='store') editStore(id);
     else if (action==='user') editUser(id);
     else if (action==='delete-product') confirmProductDelete(id);
+    else if (action==='stock-breakdown') await showStockBreakdown(id);
+    else if (action==='watch-sku'||action==='unwatch-sku') {
+      const selected=action==='watch-sku';
+      const product_id=selected?Number(button.closest('.sku-watch').querySelector('select').value):id;
+      if (!product_id) throw new Error('请先选择商品编码');
+      button.disabled=true;
+      try {
+        await api('/api/dashboard/products',{product_id,selected});
+        if (state.page==='dashboard') await loadPage();
+      } finally {
+        button.disabled=false;
+      }
+    }
     else if (action==='order') openPosting('ORDER',null,id);
     else if (action==='post') openPosting(value);
     else if (action==='detail') await showDetail(Number(button.dataset.id));

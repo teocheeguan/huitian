@@ -270,6 +270,70 @@ class InventoryTests(unittest.TestCase):
             purchased=reports.documents(db,self.hq,{'group':['purchases']})
             self.assertEqual([(p['id'],p['store'],p['total_qty']) for p in purchased],[(incoming,'B店',5)])
 
+    def test_dashboard_can_track_multiple_skus_by_account_and_date(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        yesterday = datetime.now(inv.CHINA) - timedelta(days=1)
+        with patch.object(inv,'datetime',wraps=datetime) as clock:
+            clock.now.return_value = yesterday
+            self.post(self.make('IN',self.a,self.water,11))
+            self.post(self.make('IN',self.b,self.other_size,8))
+        self.post(self.make('IN',self.a,self.water,4))
+        self.post(self.make('IN',self.b,self.empty,12))
+        request = self.http_requests()
+        response = request('/api/login',{'login':'testadmin','password':'test-account-only-42'})
+        cookie = next(line for line in response.splitlines() if line.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
+        for product in (self.water,self.other_size,self.empty,self.empty):
+            self.assertIn('200 OK',request('/api/dashboard/products',{'product_id':product,'selected':True},cookie))
+
+        with closing(inv.connect(self.path)) as db:
+            def selected(user,args):
+                return {p['id']:p['qty'] for p in reports.dashboard(db,user,args)['sku_stock'] if p['selected']}
+
+            self.assertEqual(selected(self.hq,{}),{self.water:15,self.other_size:8,self.empty:12})
+            self.assertEqual(selected(self.hq,{'day':[yesterday.date().isoformat()]}),
+                             {self.water:11,self.other_size:8,self.empty:0})
+            self.assertEqual(selected(self.hq,{'store':[str(self.b)]}),
+                             {self.water:0,self.other_size:8,self.empty:12})
+            self.assertEqual(selected(self.staff,{}),{})
+            brand_stock = reports.dashboard(db,self.hq,{})['stock']
+            self.assertEqual(sum(p['qty'] for p in brand_stock if p['brand']=='惠田' and p['kind']=='water'),23)
+        self.assertIn('200 OK',request('/api/dashboard/products',{'product_id':self.empty,'selected':False},cookie))
+        with closing(inv.connect(self.path)) as db:
+            self.assertNotIn(self.empty,selected(self.hq,{}))
+
+    def test_stock_summary_and_breakdown_respect_store_scope(self):
+        self.post(self.make('IN',self.a,self.water,6))
+        self.post(self.make('IN',self.b,self.water,9))
+        request = self.http_requests()
+        for username, password, total, stores in (
+            ('testadmin','test-account-only-42',15,{'A店':6,'B店':9}),
+            ('storea','test-branch-only-42',6,{'A店':6}),
+        ):
+            result = request('/api/login',{'login':username,'password':password})
+            cookie = next(line for line in result.splitlines() if line.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
+            result = request('/api/stock-summary',cookie=cookie)
+            self.assertIn('200 OK',result)
+            summary = json.loads(result.split('\r\n\r\n',1)[1])
+            self.assertEqual(len(summary),len({p['sku'] for p in summary}))
+            self.assertEqual({p['sku']:p['qty'] for p in summary if p['kind']=='water'}, {'W1':total,'W2':0,'W3':0})
+            result = request('/api/stock/'+str(self.water),cookie=cookie)
+            self.assertIn('200 OK',result)
+            details = json.loads(result.split('\r\n\r\n',1)[1])
+            self.assertEqual({entry['store']:entry['qty'] for entry in details},stores)
+            if username=='storea':
+                self.assertIn('403 Forbidden',request('/api/stock/'+str(self.water)+'?store='+str(self.b),cookie=cookie))
+
+    def test_demo_seed_exercises_legacy_entries(self):
+        path = Path(self.tmp.name)/'demo.sqlite'
+        inv.initialize(path)
+        app.seed_demo(path,'local-demo-only-42')
+        with closing(inv.connect(path)) as db:
+            user = inv.row(db,"SELECT id,role,store_id FROM users WHERE login='demo'")
+            self.assertGreater(reports.dashboard(db,user,{})['totals']['orders'],0)
+            self.assertTrue(reports.stock_summary(db,user,{}))
+
     def http_requests(self, base_path='', public_origin=''):
         server=SimpleNamespace(database=self.path,secure=bool(public_origin),base_path=base_path,
                                public_origin=public_origin,rate_limiter=app.RateLimiter())

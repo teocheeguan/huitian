@@ -1,6 +1,7 @@
+from collections import defaultdict
 from datetime import datetime
 
-from inventory import CHINA, Problem, phone_num, row, rows, scalar, store_for
+from inventory import CHINA, Problem, get_product, phone_num, row, rows, scalar, store_for
 
 
 def query(args, name, default=''):
@@ -43,13 +44,24 @@ def dashboard(db, user, args):
           AND NOT EXISTS(SELECT 1 FROM documents rev WHERE rev.kind='REVERSE' AND rev.linked_id=d.id
                          AND rev.business_day<=?2)
         WHERE s.active=1 AND (?1 IS NULL OR s.id=?1) GROUP BY s.id ORDER BY s.code""", (store, day))
-    stock = rows(db, """SELECT s.id AS store_id,p.brand,p.kind,SUM(l.delta) AS qty
+    stock = rows(db, """SELECT s.id AS store_id,p.id AS product_id,p.brand,p.kind,SUM(l.delta) AS qty
         FROM stock_log l JOIN documents d ON d.id=l.doc_id JOIN stores s ON s.id=l.store_id
         JOIN products p ON p.id=l.product_id
         WHERE (?1 IS NULL OR s.id=?1) AND s.active=1 AND d.business_day<=?2 AND p.kind IN ('water','empty')
-        GROUP BY s.id,p.brand,p.kind HAVING SUM(l.delta)<>0""", (store, day))
-    brands = [r['brand'] for r in rows(db, """SELECT DISTINCT brand FROM products
-        WHERE active=1 AND kind IN ('water','empty') ORDER BY brand""")]
+        GROUP BY s.id,p.id HAVING SUM(l.delta)<>0""", (store, day))
+    brand_totals = defaultdict(int)
+    sku_totals = defaultdict(int)
+    for item in stock:
+        brand_totals[item['store_id'],item['brand'],item['kind']] += item['qty']
+        sku_totals[item['product_id']] += item['qty']
+    brand_stock = [dict(store_id=store_id,brand=brand,kind=kind,qty=qty)
+                   for (store_id,brand,kind), qty in brand_totals.items()]
+    sku_stock = rows(db, """SELECT p.id,p.sku,p.name,p.brand,p.kind,(d.product_id IS NOT NULL) AS selected
+        FROM products p LEFT JOIN dashboard_products d ON d.product_id=p.id AND d.user_id=?
+        WHERE p.active=1 AND p.kind IN ('water','empty') ORDER BY p.sku""", (user['id'],))
+    for item in sku_stock:
+        item['qty'] = sku_totals[item['id']]
+    brands = sorted({item['brand'] for item in sku_stock})
     bucket_types = rows(db, """WITH daily AS (
         SELECT doc_id,bucket_id,sent,returned AS received,full_returned FROM bucket_log
         UNION ALL
@@ -66,17 +78,42 @@ def dashboard(db, user, args):
     ORDER BY s.code,p.brand,p.spec""", (store, day))
     totals = {key: sum(r[key] for r in bucket_types) for key in ('sent','received','missing')}
     totals['orders'] = sum(s['orders'] for s in stores)
-    return dict(day=day, today=datetime.now(CHINA).date().isoformat(),
-                totals=totals, stores=stores, brands=brands, stock=stock, bucket_types=bucket_types)
+    return dict(day=day, today=datetime.now(CHINA).date().isoformat(), totals=totals,
+                stores=stores, brands=brands, stock=brand_stock, sku_stock=sku_stock, bucket_types=bucket_types)
 
 
-def stock_rows(db, user, args):
+def update_dashboard_product(db, user, data):
+    selected = data.get('selected')
+    if type(selected) is not bool:
+        raise Problem('请选择添加或移除商品编码')
+    product = get_product(db, data.get('product_id'), active=selected)
+    if product['kind'] not in ('water','empty'):
+        raise Problem('请选择桶装水或空桶系列的商品编码')
+    link = (user['id'],product['id'])
+    if selected:
+        db.execute('INSERT INTO dashboard_products VALUES (?,?) ON CONFLICT DO NOTHING', link)
+    else:
+        db.execute('DELETE FROM dashboard_products WHERE user_id=? AND product_id=?', link)
+    return {'ok': True}
+
+
+def stock_summary(db, user, args):
+    store = scope(db, user, args)
+    return rows(db, '''SELECT p.id,p.sku,p.name,p.brand,p.spec,p.kind,COALESCE(SUM(i.qty),0) AS qty
+        FROM products p LEFT JOIN stock i ON i.product_id=p.id AND (?1 IS NULL OR i.store_id=?1)
+          AND EXISTS(SELECT 1 FROM stores s WHERE s.id=i.store_id AND s.active=1)
+        GROUP BY p.id HAVING p.active=1 OR COALESCE(SUM(i.qty),0)>0
+        ORDER BY p.kind DESC,p.name,p.sku''', (store,))
+
+
+def stock_rows(db, user, args, product=None):
     store = scope(db, user, args)
     return rows(db, '''SELECT s.id AS store_id,s.name AS store,p.id,p.sku,p.name,p.brand,p.spec,p.kind,p.active,
         COALESCE(i.qty,0) AS qty FROM stores s CROSS JOIN products p
         LEFT JOIN stock i ON i.store_id=s.id AND i.product_id=p.id
         WHERE s.active=1 AND (?1 IS NULL OR s.id=?1) AND (p.active=1 OR i.qty>0)
-        ORDER BY s.code,p.kind DESC,p.name,p.sku''', (store,))
+          AND (?2 IS NULL OR p.id=?2)
+        ORDER BY s.code,p.kind DESC,p.name,p.sku''', (store,product))
 
 
 def history(db, user, args):

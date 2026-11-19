@@ -95,6 +95,13 @@ input[type=date] { min-width: 122px; }
 .bucket-overview div { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 13px; }
 .bucket-overview div:last-child { border: 0; }
 .bucket-overview strong { font-variant-numeric: tabular-nums; color: var(--ink); font-size: 16px; }
+.sku-watch-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,310px),1fr)); gap: 12px; padding: 0 16px 16px; }
+.sku-watch { min-width: 0; border: 1px solid var(--line); border-radius: 8px; }
+.sku-watch-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 16px 12px; }
+.sku-watch-controls strong { font-size: 22px; }
+.sku-watch-controls small { color: var(--muted); }
+.sku-watch-picker { display: flex; flex: 1 1 210px; align-items: center; gap: 6px; }
+.sku-watch-picker select { font-size: 12px; }
 .scroll-table { overflow: auto; width: 100%; }
 table { border-collapse: collapse; text-align: left; width: 100%; white-space: nowrap; font-size: 13px; }
 th,td { padding: 10px 12px; border-bottom: 1px solid var(--line); }
