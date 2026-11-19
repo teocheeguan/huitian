@@ -124,8 +124,8 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(self.stock(self.b,self.empty),1)
         with closing(inv.connect(self.path)) as db:
             dash=reports.dashboard(db,self.hq,{})
-            self.assertEqual(dash['totals'],dict(customers=1,water=4,empty=1,sold=2,deposits=2,sent=2,returned=1,held=1))
-            self.assertEqual([store['customers'] for store in dash['stores']],[1,1])
+            self.assertEqual(dash['totals'],dict(orders=1,sent=2,received=1,missing=2))
+            self.assertEqual([store['orders'] for store in dash['stores']],[1,0])
             balances=reports.customer_balances(db,self.staff_b,self.customer,{})
             self.assertEqual((balances[0]['held'],balances[0]['deposits']),(1,2))
 
@@ -142,7 +142,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(self.stock(self.a,self.water),6)
         with closing(inv.connect(self.path)) as db:
             totals=reports.dashboard(db,self.hq,{})['totals']
-            self.assertEqual((totals['held'],totals['sold'],totals['sent'],totals['returned']),(1,3,3,0))
+            self.assertEqual(totals,dict(orders=1,sent=3,received=0,missing=1))
         with self.assertRaisesRegex(inv.Problem,'关联'):
             self.post(self.make('REVERSE',self.a,linked_id=sale,note='测试'))
         self.post(self.make('REVERSE',self.a,linked_id=reversal,note='登记错误'),self.staff)
@@ -191,19 +191,148 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(run('open.xlsx',target.getvalue(),'import-id-00002'),1)
         self.assertEqual(self.stock(self.a,self.other_brand),9)
 
-    def test_report_dates_and_opening_customer_counts(self):
+    def test_daily_bucket_ledger_rolls_over_and_keeps_yesterday(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        yesterday = datetime.now(inv.CHINA) - timedelta(days=1)
         opened=self.make('OPEN_BUCKET',self.a,self.empty,2)
         opened['items'][0]['held']=1
         self.post(opened)
+        self.post(self.make('IN',self.a,self.water,5))
+        with patch.object(inv,'datetime',wraps=datetime) as clock:
+            clock.now.return_value = yesterday
+            self.post(self.make('SALE',self.a,self.water,2,source='到店'))
         with closing(inv.connect(self.path)) as db:
-            today=reports.dashboard(db,self.hq,{})
-            self.assertEqual(today['totals']['customers'],1)
-            self.assertEqual(today['totals']['held'],1)
-            self.assertEqual(today['totals']['deposits'],2)
-            self.assertEqual(today['totals']['sent'],0)
-            previous=reports.dashboard(db,self.hq,{'start':['2000-01-01'],'end':['2000-01-01']})
-            self.assertEqual(previous['totals']['customers'],0)
-            self.assertEqual(previous['totals']['deposits'],0)
+            self.assertEqual(reports.dashboard(db,self.hq,{})['totals'],dict(orders=1,sent=0,received=0,missing=0))
+            previous=reports.dashboard(db,self.hq,{'day':[yesterday.date().isoformat()]})
+            self.assertEqual(previous['totals'],dict(orders=1,sent=2,received=0,missing=2))
+
+    def test_store_orders_split_items_and_physical_empties_without_swaps(self):
+        request=self.http_requests()
+        login=request('/api/login',{'login':'storea','password':'test-branch-only-42'})
+        cookie=next(l for l in login.splitlines() if l.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
+        with closing(inv.connect(self.path)) as db:
+            bottle=inv.save_product(db,self.hq,dict(sku='BOT',name='瓶装水',brand='惠田',
+                                    spec='500 mL',category='瓶装水'),catalog=True)
+        for store in (self.a,self.b):
+            self.post(self.make('IN',store,self.water,5))
+            self.post(self.make('IN',store,bottle,7))
+        goods=[dict(product_id=self.water,qty=3),dict(product_id=bottle,qty=2)]
+        empties=[dict(product_id=self.empty,qty=1),dict(product_id=self.other_empty,qty=2),
+                 dict(product_id=self.other_size_empty,qty=1)]
+        order=dict(store_id=self.a,items=goods,empty_returns=empties,request_key=secrets.token_hex(16))
+        rejected=dict(order,store_id=self.b)
+        self.assertIn('403 Forbidden',request('/api/orders',rejected,cookie))
+        bad=dict(order,items=[dict(product_id=self.water,qty=9)])
+        self.assertIn('409 Conflict',request('/api/orders',bad,cookie))
+        self.assertEqual(self.stock(self.a,self.other_empty),0)
+        result=request('/api/orders',order,cookie)
+        self.assertIn('200 OK',result)
+        doc=json.loads(result.split('\r\n\r\n',1)[1])['id']
+        self.assertIn('"duplicate": true',request('/api/orders',order,cookie))
+        self.assertEqual([self.stock(self.a,id) for id in (self.water,bottle,self.empty,self.other_empty,self.other_size_empty)],[2,5,1,2,1])
+        self.assertEqual([self.stock(self.b,id) for id in (self.water,bottle,self.empty,self.other_empty)],[5,7,0,0])
+        with closing(inv.connect(self.path)) as db:
+            detail=reports.document_detail(db,self.hq,doc)
+            self.assertIsNone(detail['customer_id'])
+            self.assertEqual(len(detail['stock']),5)
+            self.assertEqual(len(detail['order_buckets']),3)
+            self.assertEqual(reports.dashboard(db,self.hq,{})['totals'],dict(orders=1,sent=3,received=4,missing=2))
+            self.assertEqual(reports.documents(db,self.staff,{'group':['sales']})[0]['id'],doc)
+            self.assertIn('进货',inv.TITLES['IN'])
+        self.post(self.make('REVERSE',self.a,linked_id=doc,note='测试冲销'))
+        self.assertEqual([self.stock(self.a,id) for id in (self.water,bottle,self.empty,self.other_empty)],[5,7,0,0])
+        with closing(inv.connect(self.path)) as db:
+            self.assertEqual(reports.dashboard(db,self.hq,{})['totals'],dict(orders=0,sent=0,received=0,missing=0))
+        bottled=dict(store_id=self.a,items=[dict(product_id=bottle,qty=2)],empty_returns=[],request_key=secrets.token_hex(16))
+        self.assertIn('200 OK',request('/api/orders',bottled,cookie))
+        self.assertEqual(self.stock(self.a,bottle),5)
+        self.assertIn('404 Not Found',request('/api/customers',cookie=cookie))
+        self.assertIn('404 Not Found',request('/api/post',self.make('OPEN_STOCK',self.a,bottle,1),cookie))
+
+    def test_catalog_delete_retains_purchase_history(self):
+        with closing(inv.connect(self.path)) as db:
+            product=inv.save_product(db,self.hq,dict(sku='OTHER',name='杯子',brand='惠田',
+                                     spec='200 mL',category='其他'),catalog=True)
+        incoming,_=self.post(self.make('IN',self.b,product,5))
+        with closing(inv.connect(self.path)) as db:
+            with self.assertRaisesRegex(inv.Problem,'仍有门店库存'):
+                inv.delete_product(db,self.hq,{'id':product})
+            with self.assertRaisesRegex(inv.Problem,'关联在售'):
+                inv.delete_product(db,self.hq,{'id':self.empty})
+        self.post(self.make('OUT',self.b,product,5))
+        with closing(inv.connect(self.path)) as db:
+            inv.delete_product(db,self.hq,{'id':product})
+            with self.assertRaisesRegex(inv.Problem,'所选商品不可用'):
+                inv.get_product(db,product)
+            self.assertEqual(reports.document_detail(db,self.hq,incoming)['items'][0]['name'],'杯子')
+            purchased=reports.documents(db,self.hq,{'group':['purchases']})
+            self.assertEqual([(p['id'],p['store'],p['total_qty']) for p in purchased],[(incoming,'B店',5)])
+
+    def test_dashboard_can_track_multiple_skus_by_account_and_date(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        yesterday = datetime.now(inv.CHINA) - timedelta(days=1)
+        with patch.object(inv,'datetime',wraps=datetime) as clock:
+            clock.now.return_value = yesterday
+            self.post(self.make('IN',self.a,self.water,11))
+            self.post(self.make('IN',self.b,self.other_size,8))
+        self.post(self.make('IN',self.a,self.water,4))
+        self.post(self.make('IN',self.b,self.empty,12))
+        request = self.http_requests()
+        response = request('/api/login',{'login':'testadmin','password':'test-account-only-42'})
+        cookie = next(line for line in response.splitlines() if line.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
+        for product in (self.water,self.other_size,self.empty,self.empty):
+            self.assertIn('200 OK',request('/api/dashboard/products',{'product_id':product,'selected':True},cookie))
+
+        with closing(inv.connect(self.path)) as db:
+            def selected(user,args):
+                return {p['id']:p['qty'] for p in reports.dashboard(db,user,args)['sku_stock'] if p['selected']}
+
+            self.assertEqual(selected(self.hq,{}),{self.water:15,self.other_size:8,self.empty:12})
+            self.assertEqual(selected(self.hq,{'day':[yesterday.date().isoformat()]}),
+                             {self.water:11,self.other_size:8,self.empty:0})
+            self.assertEqual(selected(self.hq,{'store':[str(self.b)]}),
+                             {self.water:0,self.other_size:8,self.empty:12})
+            self.assertEqual(selected(self.staff,{}),{})
+            brand_stock = reports.dashboard(db,self.hq,{})['stock']
+            self.assertEqual(sum(p['qty'] for p in brand_stock if p['brand']=='惠田' and p['kind']=='water'),23)
+        self.assertIn('200 OK',request('/api/dashboard/products',{'product_id':self.empty,'selected':False},cookie))
+        with closing(inv.connect(self.path)) as db:
+            self.assertNotIn(self.empty,selected(self.hq,{}))
+
+    def test_stock_summary_and_breakdown_respect_store_scope(self):
+        self.post(self.make('IN',self.a,self.water,6))
+        self.post(self.make('IN',self.b,self.water,9))
+        request = self.http_requests()
+        for username, password, total, stores in (
+            ('testadmin','test-account-only-42',15,{'A店':6,'B店':9}),
+            ('storea','test-branch-only-42',6,{'A店':6}),
+        ):
+            result = request('/api/login',{'login':username,'password':password})
+            cookie = next(line for line in result.splitlines() if line.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
+            result = request('/api/stock-summary',cookie=cookie)
+            self.assertIn('200 OK',result)
+            summary = json.loads(result.split('\r\n\r\n',1)[1])
+            self.assertEqual(len(summary),len({p['sku'] for p in summary}))
+            self.assertEqual({p['sku']:p['qty'] for p in summary if p['kind']=='water'}, {'W1':total,'W2':0,'W3':0})
+            result = request('/api/stock/'+str(self.water),cookie=cookie)
+            self.assertIn('200 OK',result)
+            details = json.loads(result.split('\r\n\r\n',1)[1])
+            self.assertEqual({entry['store']:entry['qty'] for entry in details},stores)
+            if username=='storea':
+                self.assertIn('403 Forbidden',request('/api/stock/'+str(self.water)+'?store='+str(self.b),cookie=cookie))
+
+    def test_demo_seed_exercises_legacy_entries(self):
+        path = Path(self.tmp.name)/'demo.sqlite'
+        inv.initialize(path)
+        app.seed_demo(path,'local-demo-only-42')
+        with closing(inv.connect(path)) as db:
+            user = inv.row(db,"SELECT id,role,store_id FROM users WHERE login='demo'")
+            self.assertGreater(reports.dashboard(db,user,{})['totals']['orders'],0)
+            self.assertTrue(reports.stock_summary(db,user,{}))
 
     def http_requests(self, base_path='', public_origin=''):
         server=SimpleNamespace(database=self.path,secure=bool(public_origin),base_path=base_path,
@@ -254,7 +383,7 @@ class InventoryTests(unittest.TestCase):
         self.assertIn('; Secure',result)
         cookie=next(l for l in result.splitlines() if l.startswith('Set-Cookie: ')).split(' ',1)[1].split(';',1)[0]
         self.assertIn('200 OK',request('/huitian/api/bootstrap',cookie=cookie))
-        self.assertIn('Content-Disposition: attachment',request('/huitian/api/templates/stock',cookie=cookie))
+        self.assertIn('404 Not Found',request('/huitian/api/templates/stock',cookie=cookie))
         self.assertIn('404 Not Found',request('/api/bootstrap',cookie=cookie))
         self.assertIn('Path=/huitian/; HttpOnly',request('/huitian/api/logout',{},cookie,origin))
 

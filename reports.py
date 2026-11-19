@@ -1,6 +1,7 @@
+from collections import defaultdict
 from datetime import datetime
 
-from inventory import CHINA, Problem, phone_num, row, rows, scalar, store_for
+from inventory import CHINA, Problem, get_product, phone_num, row, rows, scalar, store_for
 
 
 def query(args, name, default=''):
@@ -37,89 +38,82 @@ def range_values(args, default_today=True):
 
 def dashboard(db, user, args):
     store = scope(db, user, args)
-    start, end = range_values(args)
-    period = (store, store, start, end)
-    by_store = rows(db, '''WITH client AS (
-        SELECT x.store_id,COUNT(DISTINCT x.customer_id) AS customers FROM (
-            SELECT c.creator_store AS store_id,c.id AS customer_id
-            FROM customers c WHERE c.creator_store IS NOT NULL AND c.created_day<=?4
-            UNION ALL
-            SELECT d.store_id,d.customer_id FROM documents d
-            WHERE d.customer_id IS NOT NULL AND d.business_day<=?4 AND d.kind<>'REVERSE'
-              AND NOT EXISTS(SELECT 1 FROM documents r WHERE r.kind='REVERSE' AND r.linked_id=d.id AND r.business_day<=?4)
-        ) x GROUP BY x.store_id
-    ), inventory AS (
-        SELECT l.store_id,
-            SUM(CASE p.kind WHEN 'water' THEN l.delta ELSE 0 END) AS water,
-            SUM(CASE p.kind WHEN 'empty' THEN l.delta ELSE 0 END) AS empty
-        FROM stock_log l JOIN products p ON p.id=l.product_id JOIN documents d ON d.id=l.doc_id
-        WHERE d.business_day<=?4 GROUP BY l.store_id
-    ), bucket AS (
-        SELECT b.store_id,
-          SUM(CASE WHEN d.business_day<=?4 THEN b.deposit_delta ELSE 0 END) AS deposits,
-          SUM(CASE WHEN d.business_day BETWEEN ?3 AND ?4 THEN b.sent ELSE 0 END) AS sent,
-          SUM(CASE WHEN d.business_day BETWEEN ?3 AND ?4 THEN b.returned ELSE 0 END) AS returned
-        FROM bucket_log b JOIN documents d ON d.id=b.doc_id WHERE d.business_day<=?4 GROUP BY b.store_id
-    ), sales AS (
-        SELECT l.store_id,SUM(l.qty) AS sold FROM sales_log l JOIN documents d ON d.id=l.doc_id
-        WHERE d.business_day BETWEEN ?3 AND ?4 GROUP BY l.store_id
+    day = date_value(query(args, 'day') or query(args, 'end') or datetime.now(CHINA).date().isoformat())
+    stores = rows(db, """SELECT s.id,s.name,COUNT(d.id) AS orders
+        FROM stores s LEFT JOIN documents d ON d.store_id=s.id AND d.kind='SALE' AND d.business_day<=?2
+          AND NOT EXISTS(SELECT 1 FROM documents rev WHERE rev.kind='REVERSE' AND rev.linked_id=d.id
+                         AND rev.business_day<=?2)
+        WHERE s.active=1 AND (?1 IS NULL OR s.id=?1) GROUP BY s.id ORDER BY s.code""", (store, day))
+    stock = rows(db, """SELECT s.id AS store_id,p.id AS product_id,p.brand,p.kind,SUM(l.delta) AS qty
+        FROM stock_log l JOIN documents d ON d.id=l.doc_id JOIN stores s ON s.id=l.store_id
+        JOIN products p ON p.id=l.product_id
+        WHERE (?1 IS NULL OR s.id=?1) AND s.active=1 AND d.business_day<=?2 AND p.kind IN ('water','empty')
+        GROUP BY s.id,p.id HAVING SUM(l.delta)<>0""", (store, day))
+    brand_totals = defaultdict(int)
+    sku_totals = defaultdict(int)
+    for item in stock:
+        brand_totals[item['store_id'],item['brand'],item['kind']] += item['qty']
+        sku_totals[item['product_id']] += item['qty']
+    brand_stock = [dict(store_id=store_id,brand=brand,kind=kind,qty=qty)
+                   for (store_id,brand,kind), qty in brand_totals.items()]
+    sku_stock = rows(db, """SELECT p.id,p.sku,p.name,p.brand,p.kind,(d.product_id IS NOT NULL) AS selected
+        FROM products p LEFT JOIN dashboard_products d ON d.product_id=p.id AND d.user_id=?
+        WHERE p.active=1 AND p.kind IN ('water','empty') ORDER BY p.sku""", (user['id'],))
+    for item in sku_stock:
+        item['qty'] = sku_totals[item['id']]
+    brands = sorted({item['brand'] for item in sku_stock})
+    bucket_types = rows(db, """WITH daily AS (
+        SELECT doc_id,bucket_id,sent,returned AS received,full_returned FROM bucket_log
+        UNION ALL
+        SELECT doc_id,bucket_id,sent,received,full_returned FROM order_bucket_log
     )
-    SELECT s.id,s.code,s.name,COALESCE(client.customers,0) AS customers,COALESCE(inventory.water,0) AS water,
-           COALESCE(inventory.empty,0) AS empty,COALESCE(sales.sold,0) AS sold,
-           COALESCE(bucket.deposits,0) AS deposits,COALESCE(bucket.sent,0) AS sent,
-           COALESCE(bucket.returned,0) AS returned
-    FROM stores s LEFT JOIN client ON client.store_id=s.id LEFT JOIN inventory ON inventory.store_id=s.id
-        LEFT JOIN bucket ON bucket.store_id=s.id LEFT JOIN sales ON sales.store_id=s.id
-        WHERE (?1 IS NULL OR s.id=?2) ORDER BY s.code''', period)
-    customers = (sum(entry['customers'] for entry in by_store) if store else
-                 scalar(db,'SELECT COUNT(*) FROM customers WHERE created_day<=?',(end,)))
-    totals = {field: sum(entry[field] for entry in by_store)
-              for field in ('water','empty','sold','deposits','sent','returned')}
-    totals['customers'] = customers
-    totals['held'] = scalar(db, '''SELECT COALESCE(SUM(b.held_delta),0) FROM bucket_log b JOIN documents d ON d.id=b.doc_id
-        WHERE (?1 IS NULL OR b.store_id=?2) AND d.business_day<=?3''', (store, store, end))
-    daily = rows(db, '''SELECT d.business_day AS day,SUM(l.qty) AS qty FROM sales_log l
-        JOIN documents d ON d.id=l.doc_id WHERE (?1 IS NULL OR l.store_id=?2)
-        AND d.business_day BETWEEN ?3 AND ?4 GROUP BY d.business_day ORDER BY d.business_day''', period)
-    use = rows(db, '''WITH detail AS (
-        SELECT l.store_id,l.customer_id,l.product_id,SUM(l.qty) AS qty
-        FROM sales_log l JOIN documents d ON d.id=l.doc_id WHERE (?1 IS NULL OR l.store_id=?2)
-          AND d.business_day BETWEEN ?3 AND ?4 GROUP BY l.store_id,l.customer_id,l.product_id
-    )
-    SELECT x.store_id,s.name AS store,p.id,p.sku,p.name,p.brand,p.spec,
-      COUNT(DISTINCT CASE WHEN x.qty>0 THEN x.customer_id END) AS customers,SUM(x.qty) AS qty
-    FROM detail x JOIN products p ON p.id=x.product_id JOIN stores s ON s.id=x.store_id
-    GROUP BY x.store_id,p.id HAVING SUM(x.qty)<>0 OR COUNT(DISTINCT CASE WHEN x.qty>0 THEN x.customer_id END)>0
-    ORDER BY s.code,qty DESC,p.name''', period)
-    per_day = rows(db, '''SELECT d.business_day AS day,s.name AS store,p.name,p.brand,p.spec,SUM(l.qty) AS qty
-        FROM sales_log l JOIN documents d ON d.id=l.doc_id JOIN products p ON p.id=l.product_id
-        JOIN stores s ON s.id=l.store_id
-        WHERE (?1 IS NULL OR l.store_id=?2) AND d.business_day BETWEEN ?3 AND ?4
-        GROUP BY d.business_day,l.store_id,l.product_id HAVING SUM(l.qty)<>0
-        ORDER BY day DESC,s.code,p.name''', period)
-    stock = rows(db, '''SELECT s.name AS store,p.id,p.name,p.sku,p.brand,p.spec,p.kind,SUM(l.delta) AS qty
-        FROM stock_log l JOIN documents d ON d.id=l.doc_id JOIN products p ON p.id=l.product_id
-        JOIN stores s ON s.id=l.store_id WHERE (?1 IS NULL OR l.store_id=?2) AND d.business_day<=?3
-        GROUP BY l.store_id,l.product_id HAVING SUM(l.delta)<>0 ORDER BY s.code,p.kind DESC,p.name''', (store,store,end))
-    bucket_types = rows(db, '''SELECT s.name AS store,p.name,p.brand,p.spec,
-        SUM(b.deposit_delta) AS deposits,SUM(b.held_delta) AS held,
-        SUM(CASE WHEN d.business_day>=?3 THEN b.sent ELSE 0 END) AS sent,
-        SUM(CASE WHEN d.business_day>=?3 THEN b.returned ELSE 0 END) AS returned,
-        SUM(CASE WHEN d.business_day>=?3 THEN b.full_returned ELSE 0 END) AS full_returned
-        FROM bucket_log b JOIN documents d ON d.id=b.doc_id JOIN products p ON p.id=b.bucket_id
-        JOIN stores s ON s.id=b.store_id WHERE (?1 IS NULL OR b.store_id=?2)
-          AND d.business_day<=?4 GROUP BY b.store_id,b.bucket_id ORDER BY s.code,p.brand,p.spec''', period)
-    return dict(start=start, end=end, totals=totals, stores=by_store, daily=daily, use=use,
-                per_day=per_day, stock=stock, bucket_types=bucket_types)
+    SELECT s.name AS store,p.brand,p.spec,SUM(q.sent) AS sent,SUM(q.received) AS received,
+        SUM(q.full_returned) AS full_returned,
+        MAX(0,SUM(q.sent-q.received-q.full_returned)) AS missing
+    FROM daily q JOIN documents d ON d.id=q.doc_id JOIN stores s ON s.id=d.store_id
+    JOIN products p ON p.id=q.bucket_id
+    LEFT JOIN documents original ON d.kind='REVERSE' AND original.id=d.linked_id
+    WHERE (?1 IS NULL OR s.id=?1) AND COALESCE(original.business_day,d.business_day)=?2
+    GROUP BY s.id,p.id HAVING SUM(q.sent)<>0 OR SUM(q.received)<>0 OR SUM(q.full_returned)<>0
+    ORDER BY s.code,p.brand,p.spec""", (store, day))
+    totals = {key: sum(r[key] for r in bucket_types) for key in ('sent','received','missing')}
+    totals['orders'] = sum(s['orders'] for s in stores)
+    return dict(day=day, today=datetime.now(CHINA).date().isoformat(), totals=totals,
+                stores=stores, brands=brands, stock=brand_stock, sku_stock=sku_stock, bucket_types=bucket_types)
 
 
-def stock_rows(db, user, args):
+def update_dashboard_product(db, user, data):
+    selected = data.get('selected')
+    if type(selected) is not bool:
+        raise Problem('请选择添加或移除商品编码')
+    product = get_product(db, data.get('product_id'), active=selected)
+    if product['kind'] not in ('water','empty'):
+        raise Problem('请选择桶装水或空桶系列的商品编码')
+    link = (user['id'],product['id'])
+    if selected:
+        db.execute('INSERT INTO dashboard_products VALUES (?,?) ON CONFLICT DO NOTHING', link)
+    else:
+        db.execute('DELETE FROM dashboard_products WHERE user_id=? AND product_id=?', link)
+    return {'ok': True}
+
+
+def stock_summary(db, user, args):
+    store = scope(db, user, args)
+    return rows(db, '''SELECT p.id,p.sku,p.name,p.brand,p.spec,p.kind,COALESCE(SUM(i.qty),0) AS qty
+        FROM products p LEFT JOIN stock i ON i.product_id=p.id AND (?1 IS NULL OR i.store_id=?1)
+          AND EXISTS(SELECT 1 FROM stores s WHERE s.id=i.store_id AND s.active=1)
+        GROUP BY p.id HAVING p.active=1 OR COALESCE(SUM(i.qty),0)>0
+        ORDER BY p.kind DESC,p.name,p.sku''', (store,))
+
+
+def stock_rows(db, user, args, product=None):
     store = scope(db, user, args)
     return rows(db, '''SELECT s.id AS store_id,s.name AS store,p.id,p.sku,p.name,p.brand,p.spec,p.kind,p.active,
         COALESCE(i.qty,0) AS qty FROM stores s CROSS JOIN products p
         LEFT JOIN stock i ON i.store_id=s.id AND i.product_id=p.id
         WHERE s.active=1 AND (?1 IS NULL OR s.id=?1) AND (p.active=1 OR i.qty>0)
-        ORDER BY s.code,p.kind DESC,p.name,p.sku''', (store,))
+          AND (?2 IS NULL OR p.id=?2)
+        ORDER BY s.code,p.kind DESC,p.name,p.sku''', (store,product))
 
 
 def history(db, user, args):
@@ -141,16 +135,17 @@ def documents(db, user, args):
         'sales': " AND (d.kind IN ('SALE','SEND','RETURN') OR o.kind IN ('SALE','SEND','RETURN'))",
         'bucket': " AND (d.kind IN ('OPEN_BUCKET','BUCKET_RETURN','DEPOSIT','REFUND','SEND') OR o.kind IN ('OPEN_BUCKET','BUCKET_RETURN','DEPOSIT','REFUND','SEND'))",
         'transfer': " AND (d.kind='TRANSFER' OR o.kind='TRANSFER')",
+        'purchases': " AND (d.kind='IN' OR o.kind='IN')",
         'all': '',
     }
     if group not in kinds:
         raise Problem('单据类型无效')
     return rows(db, '''SELECT d.id,d.kind,d.store_id,d.target_store,d.business_day,d.timestamp,d.operator_name,d.note,
-        d.linked_id,d.source,d.external_number,c.name AS customer,rev.id AS reversal_id,
+        d.linked_id,rev.id AS reversal_id,
         f.name AS store,t.name AS target,GROUP_CONCAT(i.name || ' × ' || i.qty,'、') AS detail,
         (SELECT COALESCE(SUM(i2.qty),0) FROM document_items i2 WHERE i2.doc_id=d.id) AS total_qty
         FROM documents d JOIN stores f ON f.id=d.store_id LEFT JOIN stores t ON t.id=d.target_store
-        LEFT JOIN customers c ON c.id=d.customer_id LEFT JOIN document_items i ON i.doc_id=d.id
+        LEFT JOIN document_items i ON i.doc_id=d.id
         LEFT JOIN documents rev ON rev.kind='REVERSE' AND rev.linked_id=d.id
         LEFT JOIN documents o ON o.id=d.linked_id
         WHERE (?1 IS NULL OR d.store_id=?1 OR d.target_store=?1) AND d.business_day BETWEEN ?2 AND ?3'''
@@ -176,6 +171,8 @@ def document_detail(db, user, document_id):
         (document_id,user['store_id'],user['store_id']))
     doc['buckets'] = rows(db, '''SELECT b.*,p.name,p.brand,p.spec FROM bucket_log b JOIN products p ON p.id=b.bucket_id
         WHERE b.doc_id=? ORDER BY p.name''', (document_id,))
+    doc['order_buckets'] = rows(db, '''SELECT b.*,p.name,p.brand,p.spec FROM order_bucket_log b
+        JOIN products p ON p.id=b.bucket_id WHERE b.doc_id=? ORDER BY p.brand,p.spec''', (document_id,))
     return doc
 
 
